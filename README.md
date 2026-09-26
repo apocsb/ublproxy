@@ -81,7 +81,7 @@ CSS is injected into HTML responses to hide elements matching element-hiding rul
 
 ### Scriptlet injection
 
-11 commonly-used scriptlets (`##+js()`) are injected as `<script>` tags to neutralize anti-adblock scripts, prevent tracking, and modify page behavior. Includes `set-constant`, `abort-on-property-read`, `addEventListener-defuser`, `nowebrtc`, `prevent-fetch`, and more.
+12 commonly-used scriptlets (`##+js()`) are injected as `<script>` tags to neutralize anti-adblock scripts, prevent tracking, and modify page behavior. Includes `set-constant`, `abort-on-property-read`, `addEventListener-defuser`, `nowebrtc`, `prevent-fetch`, and more.
 
 ### Users and custom rules
 
@@ -106,7 +106,8 @@ ublproxy implements the [Adblock Plus filter syntax](https://adblockplus.org/fil
 | **Priority** | `$important`, `$badfilter`, exception filters `@@` |
 | **Modifiers** | `$redirect` (19 neutered resources), `$removeparam`, `$csp`, `$permissions`, `$header` |
 | **Cosmetic** | Element hiding `##`, exceptions `#@#`, `$elemhide`, `$generichide`, `$specifichide` |
-| **Scriptlets** | `##+js()` with 11 scriptlets, `#@#+js()` exceptions |
+| **Procedural** | `#?#`/`#@?#` with `:has-text()`, `:matches-attr()`, `:matches-path()`, `:min-text-length()`, `:upward()`, `:not()`, `:others()` and the `:remove()`, `:remove-attr()`, `:remove-class()`, `:style()` actions, plus `##^` HTML filters |
+| **Scriptlets** | `##+js()` with 12 scriptlets, `#@#+js()` exceptions |
 | **Directives** | `!#if`/`!#else`/`!#endif` with boolean expressions |
 | **Entity matching** | `google.*` in `$domain=`, `$to=`, `$denyallow=`, cosmetic filters |
 

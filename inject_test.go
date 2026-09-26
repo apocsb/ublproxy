@@ -368,7 +368,7 @@ func TestElementHidingStatsCombined(t *testing.T) {
 		t.Errorf("Stripped = %d, want 1", stats.Stripped)
 	}
 
-	want := "hidden=1; stripped=1"
+	want := "hidden=1; stripped=1; procedural=0"
 	if got := stats.header(); got != want {
 		t.Errorf("header() = %q, want %q", got, want)
 	}
@@ -477,14 +477,110 @@ func TestScriptletInjection(t *testing.T) {
 		t.Error("should contain set-constant scriptlet for ads.enabled")
 	}
 
-	// Scriptlets should be injected before </head> for earliest execution
+	// Scriptlets must run before the page's own inline scripts, not just
+	// somewhere in the head. YouTube sets ytcfg and runs its anti-adblock
+	// checks in head inline scripts, so landing after them is too late.
+	headOpenIdx := strings.Index(body, "<head>")
 	headCloseIdx := strings.Index(body, "</head>")
-	if headCloseIdx < 0 {
-		t.Fatal("should still have </head> tag")
+	if headOpenIdx < 0 || headCloseIdx < 0 {
+		t.Fatal("should still have head tags")
 	}
 	rtcIdx := strings.Index(body, "RTCPeerConnection")
-	if rtcIdx > headCloseIdx {
-		t.Error("scriptlets should be injected before </head>")
+	if rtcIdx < headOpenIdx || rtcIdx > headCloseIdx {
+		t.Error("scriptlets should be injected inside <head>, before any page script")
+	}
+	// Ahead of the page's own inline script in the head.
+	titleIdx := strings.Index(body, "<title>")
+	if titleIdx >= 0 && rtcIdx > titleIdx {
+		t.Error("scriptlets should be injected before the page's first inline head script")
+	}
+}
+
+func TestInjectAtDocumentStart(t *testing.T) {
+	tests := []struct {
+		name string
+		html string
+		want string
+	}{
+		{"after head open", `<html><head><title>T</title></head><body></body></html>`, `<html><head>[X]<title>T</title></head><body></body></html>`},
+		{"head with attributes", `<html><head data-a="b"><title>T</title></head>`, `<html><head data-a="b">[X]<title>T</title></head>`},
+		{"gt inside attribute", `<html><head data-a="a>b"><title>T</title></head>`, `<html><head data-a="a>b">[X]<title>T</title></head>`},
+		{"self closing head", `<html><head/><body></body></html>`, `<html><head/>[X]<body></body></html>`},
+		// "<header>" must not be mistaken for a head tag.
+		{"no head, falls back to html", `<html><body><header>hi</header></body></html>`, `<html>[X]<body><header>hi</header></body></html>`},
+		{"uppercase", `<HTML><HEAD><title>T</title></HEAD>`, `<HTML><HEAD>[X]<title>T</title></HEAD>`},
+		{"no head no html", `<body><p>x</p></body>`, `<body><p>x</p>[X]</body>`},
+		{"bare fragment", `<p>hi</p>`, `<p>hi</p>[X]`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := string(injectAtDocumentStart([]byte(tt.html), []byte("[X]")))
+			if got != tt.want {
+				t.Errorf("injectAtDocumentStart\n got: %s\nwant: %s", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDomainScopedSelectorsSurviveServerSideFilter(t *testing.T) {
+	rs := blocklist.NewRuleSet()
+	// A Polymer app builds these after the HTML was served, so the class is
+	// nowhere in the server's markup.
+	rs.AddLine("youtube.com##.ytp-ad-module")
+	rs.AddLine("youtube.com##ytd-ad-slot-renderer")
+	rs.AddLine("youtube.com##ytd-rich-item-renderer:has(> ytd-ad-slot-renderer)")
+	// A generic rule that genuinely cannot match should still be dropped.
+	rs.AddLine("##.never-in-any-html")
+
+	p := &proxyHandler{sessions: newSessionMap()}
+	p.baselineRules.Store(rs)
+
+	htmlBody := `<html><head></head><body><ytd-app></ytd-app></body></html>`
+	resp := &http.Response{
+		StatusCode: 200,
+		Header:     http.Header{"Content-Type": []string{"text/html"}},
+		Body:       io.NopCloser(strings.NewReader(htmlBody)),
+	}
+
+	modified, stats := p.applyElementHiding(resp, "youtube.com", "127.0.0.1", false)
+	if !stats.Modified {
+		t.Fatal("expected modification")
+	}
+
+	body := string(modified)
+	for _, sel := range []string{
+		".ytp-ad-module",
+		"ytd-ad-slot-renderer",
+		"ytd-rich-item-renderer:has(> ytd-ad-slot-renderer)",
+	} {
+		if !strings.Contains(body, sel) {
+			t.Errorf("domain-scoped selector %q was dropped by the server-side pre-filter", sel)
+		}
+	}
+	if strings.Contains(body, ".never-in-any-html") {
+		t.Error("generic selector with no match should still be filtered out")
+	}
+}
+
+func TestDuplicateSelectorsInjectedOnce(t *testing.T) {
+	rs := blocklist.NewRuleSet()
+	rs.AddLine("example.com##.ad-banner")
+	rs.AddLine("example.com##.ad-banner")
+
+	p := &proxyHandler{sessions: newSessionMap()}
+	p.baselineRules.Store(rs)
+
+	htmlBody := `<html><head></head><body><div class="ad-banner">Ad</div></body></html>`
+	resp := &http.Response{
+		StatusCode: 200,
+		Header:     http.Header{"Content-Type": []string{"text/html"}},
+		Body:       io.NopCloser(strings.NewReader(htmlBody)),
+	}
+
+	modified, _ := p.applyElementHiding(resp, "example.com", "127.0.0.1", false)
+	if n := strings.Count(string(modified), ".ad-banner"); n != 1 {
+		t.Errorf("selector injected %d times, want 1", n)
 	}
 }
 
@@ -602,5 +698,200 @@ func TestScriptletInjectionFromUserRules(t *testing.T) {
 	body := string(modified)
 	if !strings.Contains(body, "RTCPeerConnection") {
 		t.Error("should contain scriptlet from user rules")
+	}
+}
+
+func TestProceduralRemovesNodeEndToEnd(t *testing.T) {
+	rs := blocklist.NewRuleSet()
+	rs.AddLine("page.example.com#?#.ad:remove()")
+
+	p := &proxyHandler{sessions: newSessionMap()}
+	p.baselineRules.Store(rs)
+
+	htmlBody := `<html><head></head><body>` +
+		`<div class="ad"><p>Ad</p></div>` +
+		`<div class="post">Content</div>` +
+		`</body></html>`
+	resp := &http.Response{
+		StatusCode: 200,
+		Header:     http.Header{"Content-Type": []string{"text/html"}},
+		Body:       io.NopCloser(strings.NewReader(htmlBody)),
+	}
+
+	body, stats := p.applyElementHiding(resp, "page.example.com", "127.0.0.1", false)
+	if stats.Procedural != 1 {
+		t.Errorf("Procedural = %d, want 1", stats.Procedural)
+	}
+	got := string(body)
+	if strings.Contains(got, "Ad") {
+		t.Errorf("matched node should be gone, got: %s", got)
+	}
+	if !strings.Contains(got, "Content") {
+		t.Error("unrelated content should survive")
+	}
+}
+
+func TestProceduralNoMatchLeavesBytesAlone(t *testing.T) {
+	rs := blocklist.NewRuleSet()
+	rs.AddLine("page.example.com#?#.ad:remove()")
+
+	p := &proxyHandler{sessions: newSessionMap()}
+	p.baselineRules.Store(rs)
+
+	// Deliberately un-normalized markup. A rule that matches nothing must not
+	// trigger a parse/render round trip, so these bytes reach the client as-is.
+	htmlBody := `<html><head><meta charset=utf-8></head><body><img src=a.png><p>Hi</p></body></html>`
+	resp := &http.Response{
+		StatusCode: 200,
+		Header:     http.Header{"Content-Type": []string{"text/html"}},
+		Body:       io.NopCloser(strings.NewReader(htmlBody)),
+	}
+
+	body, stats := p.applyElementHiding(resp, "page.example.com", "127.0.0.1", false)
+	if stats.Procedural != 0 {
+		t.Errorf("Procedural = %d, want 0", stats.Procedural)
+	}
+	if got := string(body); got != htmlBody {
+		t.Errorf("body was rewritten with no match:\n got: %s\nwant: %s", got, htmlBody)
+	}
+}
+
+func TestProceduralNoActionEmitsMarkerCSS(t *testing.T) {
+	rs := blocklist.NewRuleSet()
+	rs.AddLine("page.example.com#?#div:has-text(Sponsored)")
+
+	p := &proxyHandler{sessions: newSessionMap()}
+	p.baselineRules.Store(rs)
+
+	htmlBody := `<html><head></head><body><div>Ad <span>Sponsored</span></div><div>Real</div></body></html>`
+	resp := &http.Response{
+		StatusCode: 200,
+		Header:     http.Header{"Content-Type": []string{"text/html"}},
+		Body:       io.NopCloser(strings.NewReader(htmlBody)),
+	}
+
+	body, _ := p.applyElementHiding(resp, "page.example.com", "127.0.0.1", false)
+	got := string(body)
+	if !strings.Contains(got, "display: none !important") {
+		t.Errorf("expected marker CSS, got: %s", got)
+	}
+	if !strings.Contains(got, "ublp-phid") {
+		t.Errorf("matched node should carry the marker class, got: %s", got)
+	}
+	// Both divs are present, so hydration sees the same shape it would without
+	// the rule; the class plus CSS does the hiding.
+	if strings.Count(got, "<div") != 2 {
+		t.Errorf("no-action rule should not remove nodes, got: %s", got)
+	}
+}
+
+func TestProceduralSkippedForOtherHost(t *testing.T) {
+	rs := blocklist.NewRuleSet()
+	rs.AddLine("youtube.com#?#.ad:remove()")
+
+	p := &proxyHandler{sessions: newSessionMap()}
+	p.baselineRules.Store(rs)
+
+	htmlBody := `<html><head></head><body><div class="ad">Ad</div></body></html>`
+	resp := &http.Response{
+		StatusCode: 200,
+		Header:     http.Header{"Content-Type": []string{"text/html"}},
+		Body:       io.NopCloser(strings.NewReader(htmlBody)),
+	}
+
+	body, stats := p.applyElementHiding(resp, "other.example", "127.0.0.1", false)
+	if stats.Procedural != 0 {
+		t.Errorf("Procedural = %d, want 0 for a host with no rules", stats.Procedural)
+	}
+	if got := string(body); got != htmlBody {
+		t.Errorf("body should be untouched:\n got: %s\nwant: %s", got, htmlBody)
+	}
+}
+
+func TestProceduralRoundTripPreservesScripts(t *testing.T) {
+	rs := blocklist.NewRuleSet()
+	rs.AddLine("page.example.com#?#.ad:remove()")
+
+	p := &proxyHandler{sessions: newSessionMap()}
+	p.baselineRules.Store(rs)
+
+	// YouTube-shaped markup. Script bodies, doctype and entities have to
+	// survive verbatim or hydration breaks.
+	htmlBody := `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">` +
+		`<script nonce="n1">var ytcfg={};if (1<2){ytcfg.set({a:"b<c"});}</script>` +
+		`</head><body><div id="content"><ytd-ad-slot-renderer class="ad"></ytd-ad-slot-renderer>` +
+		`<p>a &amp; b &lt;c&gt;</p></div>` +
+		`<script nonce="n2">window.jslib=1;</script></body></html>`
+	resp := &http.Response{
+		StatusCode: 200,
+		Header:     http.Header{"Content-Type": []string{"text/html"}},
+		Body:       io.NopCloser(strings.NewReader(htmlBody)),
+	}
+
+	body, stats := p.applyElementHiding(resp, "page.example.com", "127.0.0.1", false)
+	if stats.Procedural != 1 {
+		t.Fatalf("Procedural = %d, want 1", stats.Procedural)
+	}
+	got := string(body)
+	for _, want := range []string{
+		"<!DOCTYPE html>",
+		`if (1<2){ytcfg.set({a:"b<c"});}`,
+		"window.jslib=1;",
+		"a &amp; b &lt;c&gt;",
+		`nonce="n1"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("round trip lost %q:\n%s", want, got)
+		}
+	}
+}
+
+// The three rules this whole effort started from, against YouTube-shaped
+// markup. The first two are CSS and work today; #?# is the server-side path
+// for the ad slot when the page ships it in the initial HTML.
+func TestYouTubeAdSlotRemoval(t *testing.T) {
+	rs := blocklist.NewRuleSet()
+	rs.AddLine(`youtube.com##ytd-ad-slot-renderer`)
+	rs.AddLine(`youtube.com##ytd-rich-item-renderer:has(> ytd-ad-slot-renderer)`)
+	rs.AddLine(`youtube.com#?#ytd-rich-item-renderer:has(> ytd-ad-slot-renderer):remove()`)
+	rs.AddLine(`youtube.com#?##^script:has-text(adPlacements)`)
+
+	p := &proxyHandler{sessions: newSessionMap()}
+	p.baselineRules.Store(rs)
+
+	body := `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><title>YouTube</title>` +
+		`<script nonce="a">var ytcfg = ytcfg || {};ytcfg.set({INNERTUBE_CLIENT_VERSION:"2.2"});</script>` +
+		`</head><body><ytd-app>` +
+		`<ytd-rich-item-renderer><ytd-ad-slot-renderer class="ad-slot"></ytd-ad-slot-renderer>` +
+		`<div id="video-title">Real Video</div></ytd-rich-item-renderer>` +
+		`<ytd-rich-item-renderer><div id="video-title">Another Video</div></ytd-rich-item-renderer>` +
+		`</ytd-app></body></html>`
+
+	resp := &http.Response{
+		StatusCode: 200,
+		Header:     http.Header{"Content-Type": []string{"text/html"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+
+	out, stats := p.applyElementHiding(resp, "www.youtube.com", "127.0.0.1", false)
+	got := string(out)
+
+	// The ad-carrying rich item is gone; the real one stays.
+	if strings.Contains(got, "Real Video") {
+		t.Errorf("ad-carrying rich item should be removed:\n%s", got)
+	}
+	if !strings.Contains(got, "Another Video") {
+		t.Errorf("real video should survive:\n%s", got)
+	}
+	// Both rules still emit their CSS for nodes built client-side.
+	if !strings.Contains(got, "ytd-ad-slot-renderer") {
+		t.Error("CSS rule should still be injected")
+	}
+	// Script bodies must survive the round trip verbatim.
+	if !strings.Contains(got, `ytcfg.set({INNERTUBE_CLIENT_VERSION:"2.2"});`) {
+		t.Errorf("inline script was damaged:\n%s", got)
+	}
+	if stats.Procedural == 0 {
+		t.Error("expected procedural rules to act")
 	}
 }

@@ -708,3 +708,35 @@ func TestImportantHostnameRule(t *testing.T) {
 		t.Error("$important should override the exception")
 	}
 }
+
+func TestValidateRule(t *testing.T) {
+	valid := []string{
+		"||ads.example.com^",
+		"##.ad-banner",
+		"example.com##.ad",
+		"example.com#@#.ad",
+		"example.com##+js(set-constant, a.b, 1)",
+		"example.com#?#.ad:remove()",
+		"example.com#?#ytd-rich-item-renderer:has(> ytd-ad-slot-renderer):remove()",
+		"example.com#?##^script:has-text(adPlacements)",
+		"example.com#@?#.ad:remove()",
+		"! a comment",
+		"[Adblock Plus 2.0]",
+	}
+	for _, line := range valid {
+		if err := blocklist.ValidateRule(line); err != nil {
+			t.Errorf("ValidateRule(%q) = %v, want nil", line, err)
+		}
+	}
+
+	invalid := []string{
+		"",
+		"example.com#?#div:bogus-op()",
+		"example.com#?#div:watch-attr(class)",
+	}
+	for _, line := range invalid {
+		if err := blocklist.ValidateRule(line); err == nil {
+			t.Errorf("ValidateRule(%q) = nil, want an error", line)
+		}
+	}
+}

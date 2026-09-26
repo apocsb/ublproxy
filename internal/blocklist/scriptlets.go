@@ -19,6 +19,32 @@ func ScriptletSource(name string, args []string) string {
 	return tmpl(args)
 }
 
+// ScriptletAliases returns the short names accepted in ##+js() rules.
+func ScriptletAliases() []string {
+	names := make([]string, 0, len(scriptletAliases))
+	for name := range scriptletAliases {
+		names = append(names, name)
+	}
+	return names
+}
+
+// ScriptletNames returns every scriptlet name the library can generate.
+func ScriptletNames() []string {
+	names := make([]string, 0, len(scriptletLibrary))
+	for name := range scriptletLibrary {
+		names = append(names, name)
+	}
+	return names
+}
+
+// CanonicalScriptletName resolves an alias to its canonical name.
+func CanonicalScriptletName(name string) string {
+	if canonical, ok := scriptletAliases[name]; ok {
+		return canonical
+	}
+	return name
+}
+
 // scriptletAliases maps short names to canonical scriptlet names.
 var scriptletAliases = map[string]string{
 	"set":  "set-constant",
@@ -248,43 +274,114 @@ var scriptletLibrary = map[string]func([]string) string{
 	},
 
 	"json-prune": func(args []string) string {
-		propsToRemove := ""
-		if len(args) >= 1 {
-			propsToRemove = jsStringEscape(args[0])
+		prunePaths := splitPruneArg(args, 0)
+		needlePaths := splitPruneArg(args, 1)
+		if prunePaths == "" {
+			return ""
 		}
 		return `(function() {
-	var props = '` + propsToRemove + `'.split(' ');
-	var origParse = JSON.parse;
-	JSON.parse = function() {
-		var obj = origParse.apply(this, arguments);
-		if (obj && typeof obj === 'object') {
-			for (var i = 0; i < props.length; i++) {
-				var path = props[i].split('.');
-				var target = obj;
-				for (var j = 0; j < path.length - 1; j++) {
-					if (path[j] === '*') {
-						// wildcard: apply to all keys at this level
-						if (typeof target === 'object' && target !== null) {
-							var keys = Object.keys(target);
-							for (var k = 0; k < keys.length; k++) {
-								if (typeof target[keys[k]] === 'object') {
-									delete target[keys[k]][path[path.length-1]];
-								}
-							}
-						}
-						target = null;
-						break;
-					}
-					if (!target || typeof target !== 'object') { target = null; break; }
-					target = target[path[j]];
-				}
-				if (target && typeof target === 'object') {
-					delete target[path[path.length - 1]];
-				}
+	var prunePaths = '` + jsStringEscape(prunePaths) + `'.split(' ').filter(Boolean);
+	var needlePaths = '` + jsStringEscape(needlePaths) + `'.split(' ').filter(Boolean);
+	var own = Object.prototype.hasOwnProperty;
+	// Walks a dotted path, optionally deleting what it finds. Mirrors uBlock's
+	// objectFindOwner so filters written for the extension behave the same here.
+	var findOwner = function(root, chain, prune) {
+		if (root === null || typeof root !== 'object') { return false; }
+		var dot = chain.indexOf('.');
+		var prop = dot === -1 ? chain : chain.slice(0, dot);
+		var next = dot === -1 ? '' : chain.slice(dot + 1);
+		var i, keys, found;
+		if (prop === '[-]' && Array.isArray(root)) {
+			found = false;
+			for (i = root.length; i--;) {
+				if (findOwner(root[i], next, prune) === false) { continue; }
+				if (prune) { root.splice(i, 1); }
+				found = true;
 			}
+			return found;
+		}
+		if (prop === '{-}') {
+			found = false;
+			keys = Object.keys(root);
+			for (i = 0; i < keys.length; i++) {
+				if (findOwner(root[keys[i]], next, prune) === false) { continue; }
+				if (prune) { delete root[keys[i]]; }
+				found = true;
+			}
+			return found;
+		}
+		if (prop === '*' && next === '') {
+			keys = Object.keys(root);
+			for (i = 0; i < keys.length; i++) {
+				if (prune) { delete root[keys[i]]; }
+			}
+			return true;
+		}
+		if ((prop === '[]' && Array.isArray(root)) ||
+			((prop === '{}' || prop === '*') && root instanceof Object)) {
+			found = false;
+			keys = Object.keys(root);
+			for (i = 0; i < keys.length; i++) {
+				if (findOwner(root[keys[i]], next, prune) === false) { continue; }
+				found = true;
+			}
+			return found;
+		}
+		if (own.call(root, prop) === false) { return false; }
+		if (next === '') {
+			if (prune) { delete root[prop]; }
+			return true;
+		}
+		return findOwner(root[prop], next, prune);
+	};
+	var prune = function(obj) {
+		if (obj === null || typeof obj !== 'object') { return obj; }
+		for (var n = 0; n < needlePaths.length; n++) {
+			if (findOwner(obj, needlePaths[n], false) === false) { return obj; }
+		}
+		for (var p = 0; p < prunePaths.length; p++) {
+			findOwner(obj, prunePaths[p], true);
 		}
 		return obj;
 	};
+	// YouTube and most modern sites read API responses through Response.json(),
+	// so JSON.parse alone catches nothing.
+	JSON.parse = new Proxy(JSON.parse, {
+		apply: function(target, thisArg, args) { return prune(Reflect.apply(target, thisArg, args)); }
+	});
+	if (typeof Response === 'function' && Response.prototype) {
+		Response.prototype.json = new Proxy(Response.prototype.json, {
+			apply: function(target, thisArg, args) {
+				return Reflect.apply(target, thisArg, args).then(prune);
+			}
+		});
+	}
+})();
+`
+	},
+
+	"remove-class": func(args []string) string {
+		if len(args) < 1 {
+			return ""
+		}
+		class := jsStringEscape(args[0])
+		selector := ""
+		if len(args) >= 2 {
+			selector = jsStringEscape(args[1])
+		}
+		return `(function() {
+	var cls = '` + class + `';
+	var selector = '` + selector + `' || '[' + cls + ']';
+	var remove = function() {
+		var els = document.querySelectorAll(selector);
+		for (var i = 0; i < els.length; i++) { els[i].classList.remove(cls); }
+	};
+	if (document.readyState === 'loading') {
+		document.addEventListener('DOMContentLoaded', remove);
+	} else {
+		remove();
+	}
+	new MutationObserver(remove).observe(document.documentElement, {childList: true, subtree: true, attributes: true});
 })();
 `
 	},
@@ -315,6 +412,14 @@ var scriptletLibrary = map[string]func([]string) string{
 })();
 `
 	},
+}
+
+// splitPruneArg returns the nth space-separated prune argument, or "" if absent.
+func splitPruneArg(args []string, n int) string {
+	if len(args) <= n {
+		return ""
+	}
+	return strings.TrimSpace(args[n])
 }
 
 // resolveConstantValue maps uBO constant names to JavaScript expressions.

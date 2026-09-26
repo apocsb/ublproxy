@@ -211,6 +211,10 @@ type elemHideIndex struct {
 	exceptions map[string][]*ElementHideRule
 	// cache stores computed ElementHiding per domain (immutable after RuleSet loading)
 	cache sync.Map
+	// scriptletCache stores computed scriptlet rule sets per domain
+	scriptletCache sync.Map
+	// proceduralCache stores computed procedural rule sets per domain
+	proceduralCache sync.Map
 }
 
 func newElemHideIndex() *elemHideIndex {
@@ -290,15 +294,104 @@ func (rs *RuleSet) computeElementHiding(domain string) *ElementHiding {
 }
 
 // ScriptletsForDomain returns the scriptlet rules applicable to a domain,
-// excluding those suppressed by #@#+js() exceptions.
+// excluding those suppressed by #@#+js() exceptions. Results are cached per
+// domain — the alternative is a linear scan over every scriptlet rule in the
+// list on every HTML response, and uBlock Filters ships a couple thousand.
 // Safe to call on a nil receiver (returns nil).
 func (rs *RuleSet) ScriptletsForDomain(domain string) []*ScriptletRule {
-	if rs == nil {
+	if rs == nil || rs.elemHideIdx == nil {
 		return nil
 	}
 
 	domain = strings.ToLower(domain)
 
+	if cached, ok := rs.elemHideIdx.scriptletCache.Load(domain); ok {
+		return cached.([]*ScriptletRule)
+	}
+
+	result := rs.computeScriptlets(domain)
+	rs.elemHideIdx.scriptletCache.Store(domain, result)
+	return result
+}
+
+// ProceduralForDomain returns the procedural DOM filters that apply to a
+// domain, with exceptions separated out. Results are cached per domain.
+// Safe to call on a nil receiver (returns nil).
+func (rs *RuleSet) ProceduralForDomain(domain string) (rules, exceptions []*ProceduralRule) {
+	if rs == nil || rs.elemHideIdx == nil {
+		return nil, nil
+	}
+
+	domain = strings.ToLower(domain)
+
+	if cached, ok := rs.elemHideIdx.proceduralCache.Load(domain); ok {
+		p := cached.(proceduralSet)
+		return p.rules, p.exceptions
+	}
+
+	var set proceduralSet
+	for _, rule := range rs.proceduralRules {
+		if !rule.appliesTo(domain) {
+			continue
+		}
+		if rule.Exception {
+			set.exceptions = append(set.exceptions, rule)
+		} else {
+			set.rules = append(set.rules, rule)
+		}
+	}
+	rs.elemHideIdx.proceduralCache.Store(domain, set)
+	return set.rules, set.exceptions
+}
+
+// HasProcedural reports whether the ruleset holds any procedural DOM filter at
+// all. Used to skip the parse/render round trip on pages no filter touches.
+func (rs *RuleSet) HasProcedural() bool {
+	return rs != nil && len(rs.proceduralRules) > 0
+}
+
+// Excepts reports whether this exception rule's base selector is the same as
+// one of the given rules'. An exception suppresses the rules it shadows.
+func (r *ProceduralRule) Excepts(rules []*ProceduralRule) bool {
+	if !r.Exception {
+		return false
+	}
+	for _, rule := range rules {
+		if rule.Exception {
+			continue
+		}
+		if sameRuleTarget(rule, r) {
+			return true
+		}
+	}
+	return false
+}
+
+// sameRuleTarget reports whether two rules select the same nodes: same base
+// selector, same operator chain, same action.
+func sameRuleTarget(a, b *ProceduralRule) bool {
+	if a.BaseSelector != b.BaseSelector || a.ActionName() != b.ActionName() {
+		return false
+	}
+	ao, bo := a.OpNames(), b.OpNames()
+	if len(ao) != len(bo) {
+		return false
+	}
+	for i := range ao {
+		if ao[i] != bo[i] {
+			return false
+		}
+	}
+	return true
+}
+
+type proceduralSet struct {
+	rules, exceptions []*ProceduralRule
+}
+
+// Procedural rules are applied by the proxy via ApplyTo.
+
+func (rs *RuleSet) computeScriptlets(domain string) []*ScriptletRule {
 	// Build a set of excepted scriptlet names for this domain
 	excepted := make(map[string]bool)
 	for _, rule := range rs.scriptletRules {

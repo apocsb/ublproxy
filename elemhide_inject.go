@@ -24,14 +24,15 @@ const statsHeaderName = "X-Ublproxy-Stats"
 
 // elementHidingStats reports what the proxy did to an HTML response.
 type elementHidingStats struct {
-	Modified bool // true if the response body was changed
-	Hidden   int  // CSS element-hiding selectors injected
-	Stripped int  // HTML elements (script/iframe/object/embed) removed
+	Modified   bool // true if the response body was changed
+	Hidden     int  // CSS element-hiding selectors injected
+	Stripped   int  // HTML elements (script/iframe/object/embed) removed
+	Procedural int  // nodes changed by #?# / ##^ procedural rules
 }
 
 // header returns the stats formatted for the X-Ublproxy-Stats response header.
 func (s elementHidingStats) header() string {
-	return fmt.Sprintf("hidden=%d; stripped=%d", s.Hidden, s.Stripped)
+	return fmt.Sprintf("hidden=%d; stripped=%d; procedural=%d", s.Hidden, s.Stripped, s.Procedural)
 }
 
 // styleCloseRe matches </style in any case — used to prevent XSS via
@@ -130,7 +131,9 @@ func (p *proxyHandler) applyElementHiding(resp *http.Response, host, clientIP st
 	}
 
 	// Nothing to do if there are no rules AND no script to inject
-	if baselineEH == nil && userEH == nil && !hasURLRules && scriptTag == "" && scriptletTag == "" {
+	hasProcedural := baseline.HasProcedural() || userRS.HasProcedural()
+	if baselineEH == nil && userEH == nil && !hasURLRules && scriptTag == "" &&
+		scriptletTag == "" && !hasProcedural {
 		return nil, elementHidingStats{}
 	}
 
@@ -185,9 +188,26 @@ func (p *proxyHandler) applyElementHiding(resp *http.Response, host, clientIP st
 	// Merge baseline + user element hiding selectors, then filter to only
 	// those that match classes/IDs actually present in the HTML. This avoids
 	// injecting tens of thousands of global selectors that don't apply.
-	allSelectors := mergeElementHidingSelectors(baselineEH, userEH, userRS, host, cosmeticExc)
-	selectors := filterSelectors(allSelectors, modified)
-	css := buildElementHidingCSS(selectors)
+	// Domain-scoped selectors skip the pre-filter: on single-page apps like
+	// YouTube the interesting elements are built by JavaScript and never
+	// appear in the server's HTML, so the filter would drop rules that do
+	// match once the page is live.
+	generic, specific := mergeElementHidingSelectors(baselineEH, userEH, userRS, host, cosmeticExc)
+	selectors := append(filterSelectors(generic, modified), specific...)
+	css := buildElementHidingCSS(dedupeSelectors(selectors))
+
+	// Procedural DOM filters (#?#, ##^) rewrite the tree. They run before the
+	// token pre-filter so their matches count. The parse/render round trip is
+	// only worth its cost when a rule actually applies to this host, so gate it
+	// on there being any.
+	var markerCSS string
+	if hasProcedural {
+		modified, markerCSS, stats.Procedural = applyProceduralDOM(modified, baseline, userRS, host, resp)
+		if markerCSS != "" {
+			css += markerCSS
+		}
+	}
+
 	if css != "" {
 		safeCSS := styleCloseRe.ReplaceAllString(css, `<\/style`)
 		styleTag := []byte("<style>" + safeCSS + "</style>")
@@ -198,9 +218,10 @@ func (p *proxyHandler) applyElementHiding(resp *http.Response, host, clientIP st
 		logElementHidden(host, rule, clientIP, credID)
 	}
 
-	// Inject scriptlets before </head> for earliest execution
+	// Inject scriptlets at document start so they win the race against the
+	// page's own inline scripts.
 	if scriptletTag != "" {
-		modified = injectBeforeClose(modified, []byte(scriptletTag), []byte("</head>"), []byte("</body>"), []byte("</html>"))
+		modified = injectAtDocumentStart(modified, []byte(scriptletTag))
 	}
 
 	// Inject the bootstrap script for the element picker
@@ -215,18 +236,129 @@ func (p *proxyHandler) applyElementHiding(resp *http.Response, host, clientIP st
 	return modified, stats
 }
 
+// proceduralHideClass marks nodes that a no-action procedural rule selected,
+// so the same hiding the rule asks for is emitted as CSS instead of a node
+// edit. CSS over removal because a removal changes the tree the page's own
+// scripts hydrate against.
+const proceduralHideClass = "ublp-phid"
+
+// applyProceduralDOM runs procedural rules against the response body. It
+// returns the (possibly unchanged) body, any marker CSS to inject, and the
+// number of nodes the rules affected.
+//
+// A nil or non-HTML body is returned untouched: rules that don't apply to this
+// host must not cost a parse/render round trip.
+func applyProceduralDOM(body []byte, baseline, userRS *blocklist.RuleSet, host string, resp *http.Response) ([]byte, string, int) {
+	baseRules, baseExc := baseline.ProceduralForDomain(host)
+	userRules, userExc := userRS.ProceduralForDomain(host)
+	if len(baseRules) == 0 && len(userRules) == 0 &&
+		len(baseExc) == 0 && len(userExc) == 0 {
+		return body, "", 0
+	}
+
+	doc, err := html.Parse(bytes.NewReader(body))
+	if err != nil {
+		// Truncated or malformed markup: the token CSS path still works.
+		slog.Warn("procedural/skip", "reason", "parse failed", "host", host, "err", err)
+		return body, "", 0
+	}
+
+	pagePath := "/"
+	if resp.Request != nil && resp.Request.URL != nil {
+		pagePath = resp.Request.URL.Path
+	}
+
+	// Exceptions first: a #@?# run marks nodes so the matching #?# skips them.
+	// Rules without an action only mark, for the caller to hide with CSS.
+	seen := make(map[*html.Node]bool)
+	var marked []*html.Node
+	mark := func(nodes []*html.Node) {
+		for _, n := range nodes {
+			if !seen[n] {
+				seen[n] = true
+				marked = append(marked, n)
+			}
+		}
+	}
+
+	count := 0
+	for _, exc := range baseExc {
+		if exc.Excepts(baseRules) {
+			count += exc.ApplyTo(doc, pagePath)
+		}
+	}
+	for _, exc := range userExc {
+		if exc.Excepts(baseRules) || exc.Excepts(userRules) {
+			count += exc.ApplyTo(doc, pagePath)
+		}
+	}
+	for _, rule := range baseRules {
+		if n := rule.ApplyTo(doc, pagePath); n > 0 {
+			count += n
+			if !rule.HasAction {
+				mark(rule.Matched())
+			}
+		}
+	}
+	for _, rule := range userRules {
+		if n := rule.ApplyTo(doc, pagePath); n > 0 {
+			count += n
+			if !rule.HasAction {
+				mark(rule.Matched())
+			}
+		}
+	}
+
+	if count == 0 {
+		// Nothing matched, so leave the original bytes alone rather than
+		// shipping a normalized round trip.
+		return body, "", 0
+	}
+
+	for _, n := range marked {
+		addClass(n, proceduralHideClass)
+	}
+
+	var buf bytes.Buffer
+	if err := html.Render(&buf, doc); err != nil {
+		slog.Warn("procedural/skip", "reason", "render failed", "host", host, "err", err)
+		return body, "", 0
+	}
+
+	marker := ""
+	if len(marked) > 0 {
+		marker = "." + proceduralHideClass + " {\n  display: none !important;\n}\n"
+	}
+	return buf.Bytes(), marker, count
+}
+
+func addClass(n *html.Node, class string) {
+	for _, a := range n.Attr {
+		if a.Key == "class" {
+			for _, f := range strings.Fields(a.Val) {
+				if f == class {
+					return
+				}
+			}
+			a.Val = a.Val + " " + class
+			return
+		}
+	}
+	n.Attr = append(n.Attr, html.Attribute{Key: "class", Val: class})
+}
+
 // mergeElementHidingSelectors collects element hiding selectors from baseline
 // and user RuleSets for a specific domain. User #@# exception rules suppress
 // matching baseline ## selectors. Cosmetic exceptions ($elemhide, $generichide,
 // $specifichide) are applied to suppress categories of selectors.
-// Returns nil if no selectors apply.
-func mergeElementHidingSelectors(baseline, user *blocklist.ElementHiding, userRS *blocklist.RuleSet, domain string, cosmeticExc blocklist.CosmeticFilter) []string {
+// Generic and domain-specific selectors are returned separately because only
+// the generic ones are safe to pre-filter against the server's HTML.
+// Returns nil slices if no selectors apply.
+func mergeElementHidingSelectors(baseline, user *blocklist.ElementHiding, userRS *blocklist.RuleSet, domain string, cosmeticExc blocklist.CosmeticFilter) (generic, specific []string) {
 	// $elemhide disables all element hiding
 	if cosmeticExc&blocklist.CosmeticElemHide != 0 {
-		return nil
+		return nil, nil
 	}
-
-	var selectors []string
 
 	// Add baseline selectors, filtering out any excepted by user #@# rules
 	// or cosmetic exception options
@@ -236,7 +368,7 @@ func mergeElementHidingSelectors(baseline, user *blocklist.ElementHiding, userRS
 				if userRS != nil && userRS.IsElementHideExcepted(sel, domain) {
 					continue
 				}
-				selectors = append(selectors, sel)
+				generic = append(generic, sel)
 			}
 		}
 		if cosmeticExc&blocklist.CosmeticSpecificHide == 0 {
@@ -244,7 +376,7 @@ func mergeElementHidingSelectors(baseline, user *blocklist.ElementHiding, userRS
 				if userRS != nil && userRS.IsElementHideExcepted(sel, domain) {
 					continue
 				}
-				selectors = append(selectors, sel)
+				specific = append(specific, sel)
 			}
 		}
 	}
@@ -252,14 +384,30 @@ func mergeElementHidingSelectors(baseline, user *blocklist.ElementHiding, userRS
 	// Add user selectors (their own internal exceptions already applied)
 	if user != nil {
 		if cosmeticExc&blocklist.CosmeticGenericHide == 0 {
-			selectors = append(selectors, user.GenericSelectors...)
+			generic = append(generic, user.GenericSelectors...)
 		}
 		if cosmeticExc&blocklist.CosmeticSpecificHide == 0 {
-			selectors = append(selectors, user.SpecificSelectors...)
+			specific = append(specific, user.SpecificSelectors...)
 		}
 	}
 
-	return selectors
+	return generic, specific
+}
+
+// dedupeSelectors drops repeated selectors. A rule can be present in both the
+// baseline and a subscription, and injecting it twice is pure bytes on the
+// wire. Order is preserved so the first occurrence wins.
+func dedupeSelectors(selectors []string) []string {
+	seen := make(map[string]bool, len(selectors))
+	out := selectors[:0]
+	for _, sel := range selectors {
+		if seen[sel] {
+			continue
+		}
+		seen[sel] = true
+		out = append(out, sel)
+	}
+	return out
 }
 
 // maxSelectorsPerRule limits the number of selectors in a single CSS rule.
@@ -450,17 +598,59 @@ func skipUntilClose(tokenizer *html.Tokenizer, tagName string) {
 	}
 }
 
-// injectStyleTag inserts the style tag before </head>, </body>, or at
-// the end if neither is found. Uses case-insensitive search without
-// allocating a full lowercase copy of the HTML.
+// injectAtDocumentStart inserts content as the first child of <head>, so it
+// runs before any script the page itself puts there. Falls back through
+// <html>, </head> and </body> for documents without a head, and appends if
+// none of those exist.
+func injectAtDocumentStart(htmlDoc, content []byte) []byte {
+	for _, tag := range []string{"<head", "<html"} {
+		if end := endOfOpenTag(htmlDoc, tag); end >= 0 {
+			return insertAt(htmlDoc, content, end)
+		}
+	}
+	return injectBeforeClose(htmlDoc, content, []byte("</head>"), []byte("</body>"), []byte("</html>"))
+}
+
+// endOfOpenTag returns the offset just past the '>' closing the given start
+// tag, or -1 if the tag isn't present. Quoted attribute values are skipped so
+// a '>' inside an attribute doesn't end the tag early.
+func endOfOpenTag(htmlDoc []byte, tag string) int {
+	search := 0
+	for {
+		idx := indexCaseInsensitiveFrom(htmlDoc, []byte(tag), search)
+		if idx < 0 {
+			return -1
+		}
+		// Require a tag boundary so "<header>" doesn't match "<head".
+		after := idx + len(tag)
+		if after < len(htmlDoc) {
+			c := htmlDoc[after]
+			if c != '>' && c != ' ' && c != '\t' && c != '\n' && c != '\r' && c != '/' {
+				search = after
+				continue
+			}
+		}
+		var quote byte
+		for i := after; i < len(htmlDoc); i++ {
+			c := htmlDoc[i]
+			switch {
+			case quote != 0:
+				if c == quote {
+					quote = 0
+				}
+			case c == '"' || c == '\'':
+				quote = c
+			case c == '>':
+				return i + 1
+			}
+		}
+		return -1
+	}
+}
+
+// injectStyleTag inserts the style tag as early as possible in the document.
 func injectStyleTag(htmlDoc, styleTag []byte) []byte {
-	if idx := indexCaseInsensitive(htmlDoc, []byte("</head>")); idx >= 0 {
-		return insertAt(htmlDoc, styleTag, idx)
-	}
-	if idx := indexCaseInsensitive(htmlDoc, []byte("</body>")); idx >= 0 {
-		return insertAt(htmlDoc, styleTag, idx)
-	}
-	return append(htmlDoc, styleTag...)
+	return injectAtDocumentStart(htmlDoc, styleTag)
 }
 
 func insertAt(original, insert []byte, pos int) []byte {
@@ -474,10 +664,18 @@ func insertAt(original, insert []byte, pos int) []byte {
 // indexCaseInsensitive finds needle in haystack without allocating a
 // full lowercase copy. needle must already be lowercase.
 func indexCaseInsensitive(haystack, needle []byte) int {
-	if len(needle) > len(haystack) {
+	return indexCaseInsensitiveFrom(haystack, needle, 0)
+}
+
+// indexCaseInsensitiveFrom is indexCaseInsensitive starting at from.
+func indexCaseInsensitiveFrom(haystack, needle []byte, from int) int {
+	if from < 0 {
+		from = 0
+	}
+	if len(needle) > len(haystack)-from {
 		return -1
 	}
-	for i := 0; i <= len(haystack)-len(needle); i++ {
+	for i := from; i <= len(haystack)-len(needle); i++ {
 		if bytes.EqualFold(haystack[i:i+len(needle)], needle) {
 			return i
 		}

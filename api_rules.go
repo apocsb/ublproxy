@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 
+	"ublproxy/internal/blocklist"
 	"ublproxy/internal/store"
 )
 
@@ -71,6 +72,13 @@ func (a *apiHandler) handleCreateRule(w http.ResponseWriter, r *http.Request, se
 
 	if req.Rule == "" {
 		writeJSON(w, http.StatusBadRequest, errorResponse{"rule is required"})
+		return
+	}
+
+	// Reject a rule the parser can't make sense of, with the reason. Better
+	// than storing a filter that silently never matches anything.
+	if err := blocklist.ValidateRule(req.Rule); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorResponse{err.Error()})
 		return
 	}
 

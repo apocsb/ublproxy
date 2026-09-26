@@ -2268,7 +2268,7 @@ func TestStatsHeaderOnModifiedHTML(t *testing.T) {
 		t.Fatal("X-Ublproxy-Stats header missing on modified HTML response")
 	}
 	// 2 CSS selectors hidden (both classes present in HTML), 1 script stripped
-	want := "hidden=2; stripped=1"
+	want := "hidden=2; stripped=1; procedural=0"
 	if got != want {
 		t.Errorf("X-Ublproxy-Stats = %q, want %q", got, want)
 	}
@@ -2299,7 +2299,7 @@ func TestStatsHeaderOnHTTPSModifiedHTML(t *testing.T) {
 	if got == "" {
 		t.Fatal("X-Ublproxy-Stats header missing on HTTPS modified HTML response")
 	}
-	want := "hidden=1; stripped=0"
+	want := "hidden=1; stripped=0; procedural=0"
 	if got != want {
 		t.Errorf("X-Ublproxy-Stats = %q, want %q", got, want)
 	}

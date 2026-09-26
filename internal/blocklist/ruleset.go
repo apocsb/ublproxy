@@ -2,6 +2,7 @@ package blocklist
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -35,7 +36,8 @@ type RuleSet struct {
 	redirectRules    []*Rule             // rules with $redirect= or $redirect-rule= (serve neutered resources)
 	redirectExc      []*Rule             // exception rules with $redirect-rule or $redirect-rule= (disable redirect)
 	elemHideRules    []*ElementHideRule
-	scriptletRules   []*ScriptletRule // rules with ##+js() (scriptlet injection)
+	scriptletRules   []*ScriptletRule  // rules with ##+js() (scriptlet injection)
+	proceduralRules  []*ProceduralRule // rules with #?# or ##^ (server-side DOM filters)
 	elemHideIdx      *elemHideIndex
 	OnWarning        WarnFunc // optional callback for parse warnings
 	parseErrors      int      // count of rules that failed to compile
@@ -57,6 +59,28 @@ func (rs *RuleSet) ParseErrors() int {
 		return 0
 	}
 	return rs.parseErrors
+}
+
+// ValidateRule reports whether a single line is something the parser
+// understands. The portal uses it to reject a rule up front instead of
+// accepting one that would silently never match anything.
+//
+// A line is valid if AddLine accepts it without raising a parse warning. Rules
+// that parse but are semantically useless — a typo'd CSS class, say — still
+// pass; there is no way to know that without evaluating against a page.
+func ValidateRule(line string) error {
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return errors.New("rule is empty")
+	}
+	rs := NewRuleSet()
+	var problems []string
+	rs.OnWarning = func(msg string) { problems = append(problems, msg) }
+	rs.AddLine(line)
+	if len(problems) > 0 {
+		return errors.New(strings.Join(problems, "; "))
+	}
+	return nil
 }
 
 func (rs *RuleSet) warn(msg string) {
@@ -346,7 +370,18 @@ func (rs *RuleSet) AddLine(line string) {
 		return
 	}
 
-	// Element hiding rules (##, #@#) and unsupported filters (#?#, #$#).
+	// Procedural DOM filters (#?#, #@?#, ##^) run server-side against the
+	// HTML tree. Checked before the ## branch because ##^ also contains ##.
+	if strings.Contains(line, "#?#") || strings.Contains(line, "#@?#") || strings.Contains(line, "##^") {
+		if rule := parseProceduralRule(line); rule != nil {
+			rs.proceduralRules = append(rs.proceduralRules, rule)
+		} else {
+			rs.warn("skip procedural rule " + line)
+		}
+		return
+	}
+
+	// Element hiding rules (##, #@#).
 	if strings.Contains(line, "##") || strings.Contains(line, "#@#") {
 		if rule := parseElementHideRule(line); rule != nil {
 			rs.elemHideRules = append(rs.elemHideRules, rule)
@@ -356,7 +391,7 @@ func (rs *RuleSet) AddLine(line string) {
 		}
 		return
 	}
-	if strings.Contains(line, "#?#") || strings.Contains(line, "#$#") {
+	if strings.Contains(line, "#$#") {
 		return
 	}
 

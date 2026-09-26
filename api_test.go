@@ -185,6 +185,27 @@ func TestFullPasskeyFlow(t *testing.T) {
 		t.Errorf("rules count after delete = %d, want 0", len(rules))
 	}
 
+	// A rule the parser can't make sense of is rejected with the reason,
+	// rather than stored as a filter that silently never matches.
+	rec = doRequest(t, api, "POST", "/api/rules", map[string]string{
+		"rule":   "example.com#?#div:watch-attr(class)",
+		"domain": "example.com",
+	}, regToken)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("create unsupported procedural rule: status %d, want 400; body: %s",
+			rec.Code, rec.Body.String())
+	}
+
+	// A supported procedural rule goes through.
+	rec = doRequest(t, api, "POST", "/api/rules", map[string]string{
+		"rule":   "example.com#?#ytd-ad-slot-renderer:remove()",
+		"domain": "example.com",
+	}, regToken)
+	if rec.Code != http.StatusCreated {
+		t.Errorf("create procedural rule: status %d, want 201; body: %s",
+			rec.Code, rec.Body.String())
+	}
+
 	// --- Logout ---
 	rec = doRequest(t, api, "POST", "/api/auth/logout", nil, regToken)
 	if rec.Code != http.StatusOK {

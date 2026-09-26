@@ -26,6 +26,7 @@ func TestScriptletSourceAliases(t *testing.T) {
 		{"acis", "abort-current-inline-script", []string{"eval"}},
 		{"aeld", "addEventListener-defuser", []string{"click"}},
 		{"ra", "remove-attr", []string{"onclick"}},
+		{"rc", "remove-class", []string{"ad", "div"}},
 	}
 
 	for _, tt := range tests {
@@ -37,6 +38,16 @@ func TestScriptletSourceAliases(t *testing.T) {
 		}
 		if aliasResult != canonicalResult {
 			t.Errorf("alias %q produced different output than canonical %q", tt.alias, tt.canonical)
+		}
+	}
+}
+
+// An alias pointing at a scriptlet that doesn't exist resolves to an empty
+// string, which silently turns every filter using it into a no-op.
+func TestEveryAliasResolvesToAnImplementedScriptlet(t *testing.T) {
+	for _, alias := range blocklist.ScriptletAliases() {
+		if blocklist.ScriptletSource(alias, []string{"probe-arg", "true"}) == "" {
+			t.Errorf("alias %q has no matching scriptlet in the library", alias)
 		}
 	}
 }
@@ -284,6 +295,36 @@ func TestScriptletSourceJsonPrune(t *testing.T) {
 	}
 	if !strings.Contains(got, "JSON.parse") {
 		t.Error("should patch JSON.parse")
+	}
+	// YouTube reads Innertube responses with Response.json(), never JSON.parse.
+	if !strings.Contains(got, "Response") {
+		t.Error("should patch Response.prototype.json")
+	}
+}
+
+func TestScriptletSourceJsonPruneNeedle(t *testing.T) {
+	// Second argument is a precondition: only prune when all needles are present.
+	got := blocklist.ScriptletSource("json-prune", []string{"adPlacements playerAds", "adPlacements"})
+	if got == "" {
+		t.Fatal("expected non-empty output")
+	}
+	if !strings.Contains(got, `var prunePaths = 'adPlacements playerAds'`) {
+		t.Error("first arg should be the prune paths")
+	}
+	if !strings.Contains(got, `var needlePaths = 'adPlacements'`) {
+		t.Error("second arg should be the needle paths")
+	}
+}
+
+func TestScriptletSourceJsonPruneWildcardTokens(t *testing.T) {
+	got := blocklist.ScriptletSource("json-prune", []string{"playlist.[].adserver playlist.*.adserver items[-].ad item*{-}.adserver"})
+	if got == "" {
+		t.Fatal("expected non-empty output")
+	}
+	for _, tok := range []string{"[-]", "{-}", "[]"} {
+		if !strings.Contains(got, tok) {
+			t.Errorf("expected %q token support in output", tok)
+		}
 	}
 }
 

@@ -114,31 +114,60 @@ Implementation: `internal/blocklist/`
 
 ### Procedural Cosmetic Filters
 
-All procedural operators are **not implemented**. Lines containing `#?#` are explicitly skipped.
+`#?#` and `#@?#` rules are evaluated against a parsed copy of the response body. Supported
+filter operators:
 
-- `:has()`, `:has-text()`, `:matches-attr()`, `:matches-css()`, `:matches-css-before()`, `:matches-css-after()`, `:matches-media()`, `:matches-path()`, `:matches-prop()`, `:min-text-length()`, `:not()` (extended), `:others()`, `:upward()`, `:watch-attr()`, `:xpath()`
+| Operator | Status | Notes |
+|----------|--------|-------|
+| `:has-text()` | Supported | Case-insensitive substring, or `/regex/` |
+| `:matches-attr()` | Supported | `name`, `name=value`, `name=/regex/`; `=` prefix means "either" |
+| `:matches-path()` | Supported | Unanchored by default, `/^\/…/` for an anchored match |
+| `:min-text-length()` | Supported | |
+| `:upward()` | Supported | `:upward(n)` to an n-th ancestor, or `:upward(sel)` to the nearest matching one |
+| `:not()` | Supported | Wraps one operator, e.g. `:not(:has-text(Sponsored))` |
+| `:others()` | Supported | Node must match the inner selector and be the last matching sibling |
+| `:matches-css()`, `:matches-css-before()`, `:matches-css-after()` | Not implemented | Needs resolved stylesheets, which the proxy doesn't have |
+| `:matches-media()`, `:matches-prop()` | Not implemented | |
+| `:watch-attr()` | Not implemented | Needs a live document; rules are evaluated once per response |
+| `:xpath()` | Not implemented | |
+
+A rule whose operator chain is not understood is rejected with a parse warning rather than
+being left silently inert.
 
 ### Action Operators
 
-All action operators are **not implemented**.
+| Operator | Status | Notes |
+|----------|--------|-------|
+| `:remove()` | Supported | |
+| `:remove-attr()` | Supported | Space-separated attribute names |
+| `:remove-class()` | Supported | `rc` alias |
+| `:style()` | Supported | Replaces the `style` attribute |
+| others | Not implemented | |
 
-- `:style()`, `:remove()`, `:remove-attr()`, `:remove-class()`
+A procedural rule with no action operator only *selects*. The matched nodes get an
+`ublp-phid` class and a matching `display: none` rule, so the tree shape the page's scripts
+hydrate against is unchanged.
 
 ## HTML Filters
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| `##^selector` (response-level) | Not implemented | |
+| `##^selector` | Supported | Procedural operators apply; no action operator means the match is removed |
+| `##^script:has-text()` | Supported | |
 | `##^responseheader()` | Not implemented | |
-| `##^script:has-text()` | Not implemented | |
+| `##^script`, `##^div` etc. without operators | Supported | Plain element removal |
 
-Note: ublproxy has its own resource stripping that removes `<script>`, `<iframe>`, `<object>`, `<embed>` elements whose `src`/`data` attribute resolves to a blocked URL. This is a different mechanism from uBO's HTML filters.
+Note: ublproxy has its own resource stripping that removes `<script>`, `<iframe>`, `<object>`, `<embed>` elements whose `src`/`data` attribute resolves to a blocked URL. This is a different mechanism from uBO's HTML filters, and it runs before the procedural pass.
+
+The procedural pass only parses and re-renders the body when a rule actually applies to the
+host *and* matches something. Pages no filter touches are forwarded byte for byte, so the
+normalization that parsing introduces never reaches a client.
 
 ## Scriptlet Injection
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| `##+js(token, args)` | Supported | 11 scriptlets: `set-constant`, `abort-on-property-read`, `abort-on-property-write`, `abort-current-inline-script`, `addEventListener-defuser`, `nowebrtc`, `no-setTimeout-if`, `no-setInterval-if`, `prevent-fetch`, `json-prune`, `remove-attr`. Aliases: `set`, `aopr`, `aopw`, `acis`, `aeld`, `ra`, `rc` |
+| `##+js(token, args)` | Supported | 12 scriptlets: `set-constant`, `abort-on-property-read`, `abort-on-property-write`, `abort-current-inline-script`, `addEventListener-defuser`, `nowebrtc`, `no-setTimeout-if`, `no-setInterval-if`, `prevent-fetch`, `json-prune`, `remove-attr`, `remove-class`. Aliases: `set`, `aopr`, `aopw`, `acis`, `aeld`, `ra`, `rc` |
 | `#@#+js()` (exceptions) | Supported | Suppresses matching scriptlet by name for a domain |
 | Domain-scoped scriptlets | Supported | e.g. `example.com##+js(nowebrtc)` |
 | Generic scriptlets | Supported | e.g. `##+js(abort-on-property-read, detectAdBlock)` applies to all domains |
