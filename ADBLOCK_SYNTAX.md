@@ -171,7 +171,11 @@ normalization that parsing introduces never reaches a client.
 | `#@#+js()` (exceptions) | Supported | Suppresses matching scriptlet by name for a domain |
 | Domain-scoped scriptlets | Supported | e.g. `example.com##+js(nowebrtc)` |
 | Generic scriptlets | Supported | e.g. `##+js(abort-on-property-read, detectAdBlock)` applies to all domains |
-| `json-prune` | Supported | Hooks `JSON.parse` and `Response.prototype.json`. Paths are space-separated after the single comma; all are deleted, and all must be present first |
+| `json-prune` | Supported | Hooks `JSON.parse`, `Response.prototype.json` and inline `ytInitialPlayerResponse`. All listed paths are deleted, and all must be present first |
+
+Do not mix wrapped and unwrapped spellings in one rule. `json-prune, playerResponse.adPlacements adPlacements`
+can never fire: the guard needs every needle present, and no payload carries both the wrapped
+and the bare form. Use one rule per carrier shape.
 
 Note on domain scoping: a `www.example.com##+js(...)` rule matches `www.example.com` and its
 subdomains only, not the apex `example.com` or a sibling like `m.example.com`.

@@ -373,6 +373,23 @@ func TestScriptletJsonPruneDomainScoping(t *testing.T) {
 	}
 }
 
+// YouTube ships the player's pre-roll schedule as an inline object literal
+// assigned to a global, so neither JSON.parse nor Response.json ever sees it.
+// The scriptlet has to intercept the assignment itself.
+func TestScriptletJsonPruneHooksInlinePlayerResponse(t *testing.T) {
+	got := blocklist.ScriptletSource("json-prune", []string{"a.b a.c"})
+	if !strings.Contains(got, "ytInitialPlayerResponse") {
+		t.Errorf("should intercept the inline player response, got:\n%s", got)
+	}
+	if !strings.Contains(got, "defineProperty") {
+		t.Errorf("needs a property setter to catch the assignment, got:\n%s", got)
+	}
+}
+
+// The hook only works if it is installed before the page's inline script runs,
+// which is what document-start injection is for. That ordering is covered by
+// TestJsonPruneHookPrecedesInlinePlayerResponse in the main package, which
+// goes through the real injection path.
 func TestScriptletSourceJsonPruneWildcardTokens(t *testing.T) {
 	got := blocklist.ScriptletSource("json-prune", []string{"playlist.[].adserver playlist.*.adserver items[-].ad item*{-}.adserver"})
 	if got == "" {

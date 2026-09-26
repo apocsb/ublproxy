@@ -895,3 +895,80 @@ func TestYouTubeAdSlotRemoval(t *testing.T) {
 		t.Error("expected procedural rules to act")
 	}
 }
+
+// YouTube assigns the player's ad schedule as an inline object literal, so
+// json-prune has to install its hook before that assignment runs. Ordering is
+// the whole game here: installed a moment later it is useless.
+func TestJsonPruneHookPrecedesInlinePlayerResponse(t *testing.T) {
+	rs := blocklist.NewRuleSet()
+	rs.AddLine(`www.youtube.com##+js(json-prune, adPlacements playerAds)`)
+
+	p := &proxyHandler{sessions: newSessionMap()}
+	p.baselineRules.Store(rs)
+
+	body := `<html><head></head><body>` +
+		`<script nonce="x">var ytInitialPlayerResponse = {"adPlacements":[{"a":1}]};</script>` +
+		`</body></html>`
+	resp := &http.Response{
+		StatusCode: 200,
+		Header:     http.Header{"Content-Type": []string{"text/html"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+
+	out, _ := p.applyElementHiding(resp, "www.youtube.com", "127.0.0.1", false)
+	got := string(out)
+
+	hookAt := strings.Index(got, "Object.defineProperty(window, 'ytInitialPlayerResponse'")
+	assignAt := strings.Index(got, "var ytInitialPlayerResponse")
+	if hookAt < 0 {
+		t.Fatalf("hook was not injected:\n%s", got)
+	}
+	if assignAt < 0 {
+		t.Fatalf("page script missing from output:\n%s", got)
+	}
+	if hookAt > assignAt {
+		t.Errorf("hook must be installed before the page assigns it (hook@%d, assign@%d):\n%s",
+			hookAt, assignAt, got)
+	}
+}
+
+// Authoring pitfall worth recording: the rule as it appears in the wild lists
+// both the wrapped and unwrapped form of the ad paths. json-prune needs every
+// needle present, and no single payload carries both `playerResponse.adPlacements`
+// and a top-level `adPlacements`, so that rule can never fire on either
+// carrier. Listing both forms is what disabled it.
+func TestJsonPruneRuleForInlinePlayerResponse(t *testing.T) {
+	rs := blocklist.NewRuleSet()
+	rs.AddLine(`www.youtube.com##+js(json-prune, adPlacements playerAds adSlots)`)
+
+	p := &proxyHandler{sessions: newSessionMap()}
+	p.baselineRules.Store(rs)
+
+	watchPage := `<html><head></head><body><script nonce="x">var ytInitialPlayerResponse = ` +
+		`{"adPlacements":[{"adPlacementRenderer":{"config":{"adPlacementConfig":` +
+		`{"kind":"AD_PLACEMENT_KIND_START"}}}}],"videoDetails":{"videoId":"abc"},` +
+		`"streamingData":{"expiresInSeconds":"21540"}};</script></body></html>`
+
+	resp := &http.Response{
+		StatusCode: 200,
+		Header:     http.Header{"Content-Type": []string{"text/html"}},
+		Body:       io.NopCloser(strings.NewReader(watchPage)),
+	}
+	out, _ := p.applyElementHiding(resp, "www.youtube.com", "127.0.0.1", false)
+	got := string(out)
+
+	hook := "Object.defineProperty(window, 'ytInitialPlayerResponse'"
+	hookAt := strings.Index(got, hook)
+	assignAt := strings.Index(got, "var ytInitialPlayerResponse")
+	if hookAt < 0 {
+		t.Fatalf("inline-response hook missing:\n%s", got)
+	}
+	if hookAt > assignAt {
+		t.Errorf("hook@%d must precede the page's assignment@%d", hookAt, assignAt)
+	}
+	// The proxy must not rewrite the page's own script; pruning happens in the
+	// browser, not in the bytes on the wire.
+	if !strings.Contains(got, "AD_PLACEMENT_KIND_START") {
+		t.Error("page script should pass through untouched")
+	}
+}

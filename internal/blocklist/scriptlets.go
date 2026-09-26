@@ -365,6 +365,21 @@ var scriptletLibrary = map[string]func([]string) string{
 			}
 		});
 	}
+	// YouTube does not send the player's ad schedule as JSON over the wire. It
+	// assigns an inline object literal to a global and hands that object
+	// straight to the player as raw_player_response, so neither hook above can
+	// see it. Intercept the assignment instead: defining an accessor puts the
+	// property on window first, so the page's own "var" declaration finds it
+	// already there and routes its initializer through the setter rather than
+	// redefining it.
+	try {
+		var slot = { value: prune(window.ytInitialPlayerResponse) };
+		Object.defineProperty(window, 'ytInitialPlayerResponse', {
+			configurable: true,
+			get: function() { return slot.value; },
+			set: function(val) { slot.value = prune(val); }
+		});
+	} catch (e) { /* window not extensible, or property is locked down */ }
 })();
 `
 	},
