@@ -340,11 +340,12 @@ func TestScriptletJsonPruneRealFilterLine(t *testing.T) {
 	if !strings.Contains(got, "var prunePaths = '"+all+"'") {
 		t.Errorf("every path should be pruned, got:\n%s", got)
 	}
-	// uBO's json-prune deletes every needle but only once all of them are
-	// found, so the paths double as their own precondition. An empty
-	// needle list makes the guard vacuous and the rule prune blindly.
-	if !strings.Contains(got, "var needlePaths = '"+all+"'") {
-		t.Errorf("paths should also gate the prune, got:\n%s", got)
+	// The needle argument is optional in uBlock, and this line supplies only
+	// one argument, so there is no precondition: each path is deleted from
+	// every response that carries it. That is why uBlock lists both the
+	// wrapped and the bare form of a key in the same rule.
+	if !strings.Contains(got, "var needlePaths = ''") {
+		t.Errorf("a single-argument rule should prune unconditionally, got:\n%s", got)
 	}
 }
 

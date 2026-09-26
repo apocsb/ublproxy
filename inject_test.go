@@ -932,11 +932,10 @@ func TestJsonPruneHookPrecedesInlinePlayerResponse(t *testing.T) {
 	}
 }
 
-// Authoring pitfall worth recording: the rule as it appears in the wild lists
-// both the wrapped and unwrapped form of the ad paths. json-prune needs every
-// needle present, and no single payload carries both `playerResponse.adPlacements`
-// and a top-level `adPlacements`, so that rule can never fire on either
-// carrier. Listing both forms is what disabled it.
+// uBlock's rule lists both the wrapped and the bare form of the ad paths. The
+// needle argument is optional in json-prune, so with a single argument there is
+// no precondition and each listed path is pruned from whatever payload carries
+// it. Listing both forms is deliberate, not self-defeating.
 func TestJsonPruneRuleForInlinePlayerResponse(t *testing.T) {
 	rs := blocklist.NewRuleSet()
 	rs.AddLine(`www.youtube.com##+js(json-prune, adPlacements playerAds adSlots)`)
@@ -970,5 +969,63 @@ func TestJsonPruneRuleForInlinePlayerResponse(t *testing.T) {
 	// browser, not in the bytes on the wire.
 	if !strings.Contains(got, "AD_PLACEMENT_KIND_START") {
 		t.Error("page script should pass through untouched")
+	}
+}
+
+// A CSP nonce in the response makes 'unsafe-inline' inert, so an injected
+// inline script without that nonce is blocked and the scriptlet silently never
+// runs. This is what killed every ##+js() rule on YouTube. Reusing the page's
+// own nonce works because we are rewriting that same response.
+func TestScriptletInjectionCarriesPageCSPNonce(t *testing.T) {
+	rs := blocklist.NewRuleSet()
+	rs.AddLine(`www.youtube.com##+js(json-prune, adPlacements)`)
+
+	p := &proxyHandler{sessions: newSessionMap()}
+	p.baselineRules.Store(rs)
+
+	body := `<html><head><script nonce="gmtL5wrq9y9E5TLmgdIVzA">var a=1;</script></head>` +
+		`<body></body></html>`
+	resp := &http.Response{
+		StatusCode: 200,
+		Header:     http.Header{"Content-Type": []string{"text/html"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+
+	out, _ := p.applyElementHiding(resp, "www.youtube.com", "127.0.0.1", false)
+	got := string(out)
+
+	hookAt := strings.Index(got, "prunePaths")
+	if hookAt < 0 {
+		t.Fatalf("scriptlet not injected:\n%s", got)
+	}
+	open := got[:hookAt]
+	lastOpen := strings.LastIndex(open, "<script")
+	tag := got[lastOpen : lastOpen+strings.Index(got[lastOpen:], ">")+1]
+	if !strings.Contains(tag, `nonce="gmtL5wrq9y9E5TLmgdIVzA"`) {
+		t.Errorf("injected script needs the page's CSP nonce, got tag: %s", tag)
+	}
+	if strings.Index(tag, "nonce=") > strings.Index(tag, ">") {
+		t.Errorf("nonce must be an attribute of the script tag, got: %s", tag)
+	}
+}
+
+// Pages without a CSP nonce must still get a plain script tag.
+func TestScriptletInjectionWithoutCSPNonce(t *testing.T) {
+	rs := blocklist.NewRuleSet()
+	rs.AddLine(`example.com##+js(json-prune, adPlacements)`)
+
+	p := &proxyHandler{sessions: newSessionMap()}
+	p.baselineRules.Store(rs)
+
+	body := `<html><head><script>var a=1;</script></head><body></body></html>`
+	resp := &http.Response{
+		StatusCode: 200,
+		Header:     http.Header{"Content-Type": []string{"text/html"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+
+	out, _ := p.applyElementHiding(resp, "example.com", "127.0.0.1", false)
+	if strings.Contains(string(out), "nonce=") {
+		t.Errorf("must not invent a nonce when the page has none:\n%s", out)
 	}
 }

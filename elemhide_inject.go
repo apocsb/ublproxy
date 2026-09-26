@@ -221,7 +221,7 @@ func (p *proxyHandler) applyElementHiding(resp *http.Response, host, clientIP st
 	// Inject scriptlets at document start so they win the race against the
 	// page's own inline scripts.
 	if scriptletTag != "" {
-		modified = injectAtDocumentStart(modified, []byte(scriptletTag))
+		modified = injectAtDocumentStart(modified, []byte(withCSPNonce(scriptletTag, cspNonce(modified))))
 	}
 
 	// Inject the bootstrap script for the element picker
@@ -469,6 +469,35 @@ func buildScriptletTag(baselineScriptlets, userScriptlets []*blocklist.Scriptlet
 	}
 
 	return "<script>" + b.String() + "</script>"
+}
+
+// cspNonce returns the first nonce attribute value present in the page, or "".
+// A response whose CSP lists a nonce ignores 'unsafe-inline', so an injected
+// inline script carrying no nonce is refused outright and the scriptlet is a
+// silent no-op. YouTube publishes one, which made every ##+js() rule dead
+// there until this was noticed. We reuse the page's own nonce because we are
+// rewriting that very response, so the value is already valid for it.
+func cspNonce(htmlDoc []byte) string {
+	const key = `nonce="`
+	i := indexCaseInsensitive(htmlDoc, []byte(key))
+	if i < 0 {
+		return ""
+	}
+	rest := htmlDoc[i+len(key):]
+	j := bytes.IndexByte(rest, '"')
+	if j < 0 {
+		return ""
+	}
+	return string(rest[:j])
+}
+
+// withCSPNonce adds a nonce attribute to a generated <script> tag. A no-op when
+// the page has no nonce, which is the common case and always safe.
+func withCSPNonce(tag, nonce string) string {
+	if nonce == "" {
+		return tag
+	}
+	return strings.Replace(tag, "<script>", `<script nonce="`+nonce+`">`, 1)
 }
 
 // injectBeforeClose inserts content before the first found closing tag,

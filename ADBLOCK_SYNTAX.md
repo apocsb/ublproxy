@@ -171,11 +171,17 @@ normalization that parsing introduces never reaches a client.
 | `#@#+js()` (exceptions) | Supported | Suppresses matching scriptlet by name for a domain |
 | Domain-scoped scriptlets | Supported | e.g. `example.com##+js(nowebrtc)` |
 | Generic scriptlets | Supported | e.g. `##+js(abort-on-property-read, detectAdBlock)` applies to all domains |
-| `json-prune` | Supported | Hooks `JSON.parse`, `Response.prototype.json` and inline `ytInitialPlayerResponse`. All listed paths are deleted, and all must be present first |
+| `json-prune` | Supported | Hooks `JSON.parse`, `Response.prototype.json` and inline `ytInitialPlayerResponse`. Signature is `json-prune, prunePaths, needlePaths` |
+| CSP nonce on injected scriptlets | Supported | The page's own `nonce="…"` is reused so hardened sites do not refuse the script |
 
-Do not mix wrapped and unwrapped spellings in one rule. `json-prune, playerResponse.adPlacements adPlacements`
-can never fire: the guard needs every needle present, and no payload carries both the wrapped
-and the bare form. Use one rule per carrier shape.
+`json-prune`'s second argument is optional and is the only precondition. When it is present,
+every path in it must exist before anything is pruned. When it is absent — which is what real
+filter text produces, since `json-prune, a b c` has one comma — there is no precondition and
+each listed path is deleted from any payload carrying it.
+
+That means wrapped and bare spellings belong in the same rule. `json-prune, playerResponse.adPlacements
+adPlacements` is correct and covers both a nested and a top-level player response; splitting it
+into two rules, or dropping the wrapped half, is not required. See D0.md.
 
 Note on domain scoping: a `www.example.com##+js(...)` rule matches `www.example.com` and its
 subdomains only, not the apex `example.com` or a sibling like `m.example.com`.
@@ -206,5 +212,5 @@ Environment tokens: `ext_ublock`=true, `cap_html_filtering`=true, `false`=false.
 - **Response header modification**: `$csp`, `$permissions`, `$removeparam` applied across all proxy paths (HTTP, CONNECT, transparent)
 - **Response header blocking**: `$header=` checks response headers post-fetch to block matching requests
 - **Redirect resources**: 19 neutered resources for `$redirect` / `$redirect-rule` with alias support
-- **Scriptlet injection**: 11 most-used scriptlets injected via `<script>` tags before `</head>`, with `</script>` sanitization
+- **Scriptlet injection**: 12 scriptlets injected as the first child of `<head>`, with `</script>` sanitization and the page's CSP nonce reused
 - **Parse error visibility**: `OnWarning` callback and `ParseErrors()` counter for malformed rules

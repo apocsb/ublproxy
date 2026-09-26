@@ -279,15 +279,13 @@ var scriptletLibrary = map[string]func([]string) string{
 		if prunePaths == "" {
 			return ""
 		}
-		// uBlock's json-prune deletes every needle but only once all of them
-		// are found, so with no explicit needle argument the paths gate
-		// themselves. Filter text has a single comma, so `json-prune, a b c`
-		// arrives as one argument; without this the precondition is vacuous
-		// and the rule prunes any response that merely carries one of the
-		// keys, including the ones uBlock would have left alone.
-		if needlePaths == "" {
-			needlePaths = prunePaths
-		}
+		// uBlock's json-prune signature is `json-prune, prunePaths, needlePaths`.
+		// The second argument is optional and is the only precondition: when it
+		// is absent the paths are pruned unconditionally, and when it is present
+		// every one of its paths must exist before anything is removed. Filter
+		// text carrying a single comma therefore prunes blindly, which is how
+		// uBlock's own YouTube rule deletes both the wrapped and the bare form of
+		// a key from the same payload.
 		return `(function() {
 	var prunePaths = '` + jsStringEscape(prunePaths) + `'.split(' ').filter(Boolean);
 	var needlePaths = '` + jsStringEscape(needlePaths) + `'.split(' ').filter(Boolean);
