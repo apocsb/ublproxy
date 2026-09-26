@@ -316,6 +316,63 @@ func TestScriptletSourceJsonPruneNeedle(t *testing.T) {
 	}
 }
 
+// The real filter text carries one comma, so all the paths land in a single
+// argument. TestScriptletSourceJsonPruneNeedle hand-feeds two arguments, a
+// shape parseScriptletRule never produces — this one goes through the parser
+// so the two can't drift apart again.
+func TestScriptletJsonPruneRealFilterLine(t *testing.T) {
+	rs := blocklist.NewRuleSet()
+	rs.AddLine(`www.youtube.com##+js(json-prune, playerResponse.adPlacements ` +
+		`playerResponse.playerAds playerResponse.adSlots adPlacements playerAds adSlots)`)
+
+	rules := rs.ScriptletsForDomain("www.youtube.com")
+	if len(rules) != 1 {
+		t.Fatalf("got %d scriptlet rules, want 1", len(rules))
+	}
+	got := blocklist.ScriptletSource(rules[0].Name, rules[0].Args)
+	if got == "" {
+		t.Fatal("expected non-empty output")
+	}
+
+	all := "playerResponse.adPlacements playerResponse.playerAds " +
+		"playerResponse.adSlots adPlacements playerAds adSlots"
+
+	if !strings.Contains(got, "var prunePaths = '"+all+"'") {
+		t.Errorf("every path should be pruned, got:\n%s", got)
+	}
+	// uBO's json-prune deletes every needle but only once all of them are
+	// found, so the paths double as their own precondition. An empty
+	// needle list makes the guard vacuous and the rule prune blindly.
+	if !strings.Contains(got, "var needlePaths = '"+all+"'") {
+		t.Errorf("paths should also gate the prune, got:\n%s", got)
+	}
+}
+
+func TestScriptletSourceJsonPruneExplicitNeedlesOverride(t *testing.T) {
+	// With an explicit second argument it still wins over the prune paths.
+	got := blocklist.ScriptletSource("json-prune", []string{"a.b c.d", "c.d"})
+	if !strings.Contains(got, `var needlePaths = 'c.d'`) {
+		t.Errorf("explicit needles should be used verbatim, got:\n%s", got)
+	}
+}
+
+func TestScriptletJsonPruneDomainScoping(t *testing.T) {
+	rs := blocklist.NewRuleSet()
+	rs.AddLine(`www.youtube.com##+js(json-prune, a.b a.c)`)
+
+	if got := rs.ScriptletsForDomain("www.youtube.com"); len(got) != 1 {
+		t.Errorf("www.youtube.com: got %d rules, want 1", len(got))
+	}
+	// domainMatchesOrIsSubdomain means the apex and m. do not match a
+	// www-scoped rule. Worth pinning: it's a silent, easy-to-miss gap.
+	if got := rs.ScriptletsForDomain("youtube.com"); len(got) != 0 {
+		t.Errorf("youtube.com: got %d rules, want 0", len(got))
+	}
+	if got := rs.ScriptletsForDomain("m.youtube.com"); len(got) != 0 {
+		t.Errorf("m.youtube.com: got %d rules, want 0", len(got))
+	}
+}
+
 func TestScriptletSourceJsonPruneWildcardTokens(t *testing.T) {
 	got := blocklist.ScriptletSource("json-prune", []string{"playlist.[].adserver playlist.*.adserver items[-].ad item*{-}.adserver"})
 	if got == "" {

@@ -279,6 +279,15 @@ var scriptletLibrary = map[string]func([]string) string{
 		if prunePaths == "" {
 			return ""
 		}
+		// uBlock's json-prune deletes every needle but only once all of them
+		// are found, so with no explicit needle argument the paths gate
+		// themselves. Filter text has a single comma, so `json-prune, a b c`
+		// arrives as one argument; without this the precondition is vacuous
+		// and the rule prunes any response that merely carries one of the
+		// keys, including the ones uBlock would have left alone.
+		if needlePaths == "" {
+			needlePaths = prunePaths
+		}
 		return `(function() {
 	var prunePaths = '` + jsStringEscape(prunePaths) + `'.split(' ').filter(Boolean);
 	var needlePaths = '` + jsStringEscape(needlePaths) + `'.split(' ').filter(Boolean);
